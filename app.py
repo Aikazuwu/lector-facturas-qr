@@ -16,7 +16,8 @@ import zipfile
 import io
 
 # --------- Configuración Tesseract ---------
-# Si lo corres en local y no detecta tesseract, descomenta la siguiente línea:
+# NOTA: En Streamlit Cloud esto se ignora porque se usa packages.txt.
+# Si lo corres en local (Windows) y no detecta tesseract, descomenta la línea:
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # --------- Constantes ---------
@@ -85,9 +86,12 @@ def es_dni_valido(d):
 
 def limpiar_dni(cad): return cad.replace('.', '').replace(',', '').replace(' ', '')
 
-def extraer_dni_de_pdf(ruta_pdf, allowed_dni_set):
+def extraer_dni_de_pdf(ruta_pdf, padron_dict):
+    # padron_dict es un diccionario {dni: {datos...}}
     texto = extraer_texto_pdf_y_roi(ruta_pdf)
     candidatos = []
+    
+    # Búsquedas Regex
     for m in REGEX_DNI_KEY.finditer(texto):
         d = limpiar_dni(m.group(1))
         if es_dni_valido(d): candidatos.append(d)
@@ -100,9 +104,13 @@ def extraer_dni_de_pdf(ruta_pdf, allowed_dni_set):
             d = m.group(1)
             if es_dni_valido(d): candidatos.append(d)
             
-    if allowed_dni_set:
+    # Prioridad: Si está en el padrón, ganamos.
+    if padron_dict:
         for cand in candidatos:
-            if limpiar_dni(cand) in allowed_dni_set: return cand
+            clean = limpiar_dni(cand)
+            if clean in padron_dict:
+                return clean
+    
     return candidatos[0] if candidatos else ''
 
 # --- Periodo ---
@@ -128,7 +136,7 @@ def extraer_periodo_de_pdf(ruta_pdf):
         if mm: return yyyy + mm
     return ''
 
-# --- QR ---
+# --- QR (Actualizado para sacar Fecha, Importe, CAE) ---
 def extraer_url_de_pdf(ruta_pdf):
     try:
         doc = fitz.open(ruta_pdf)
@@ -151,67 +159,170 @@ def extraer_url_de_pdf(ruta_pdf):
     except: pass
     return None
 
-def parsear_campos_qr(url):
+def parsear_campos_qr_completo(url):
+    """
+    Retorna: cuit, tipo, pto, nro, fecha, importe, cae
+    """
     qs = parse_qs(urlparse(url).query)
     p = qs.get('p',[None])[0] or (re.search(r'[?&]p=([^&]+)',url) or [None])[0]
-    if not p: return None,None,None,None
+    
+    # Valores por defecto
+    res = {'cuit':'', 'tipo':'', 'pto':'', 'nro':'', 'fecha':'', 'importe':'', 'cae':''}
+    
+    if not p: return res
     try:
         dec = base64.b64decode(p).decode('utf-8')
-    except: return None,None,None,None
+    except: return res
+
     if dec.strip().startswith('{'):
         try:
             d = json.loads(dec)
-            return (str(d.get('cuit','')), str(d.get('tipoCmp','')), str(d.get('ptoVta','')), str(d.get('nroCmp','')))
-        except: return None,None,None,None
+            res['cuit'] = str(d.get('cuit',''))
+            res['tipo'] = str(d.get('tipoCmp',''))
+            res['pto']  = str(d.get('ptoVta',''))
+            res['nro']  = str(d.get('nroCmp',''))
+            res['fecha']= str(d.get('fecha','')) # Formato YYYY-MM-DD usualmente en JSON AFIP
+            res['importe'] = str(d.get('importe',''))
+            res['cae'] = str(d.get('codAut',''))
+            return res
+        except: return res
+        
+    # Formato antiguo pipe (menos común en QR V1, pero posible)
+    # orden usual: version|fecha|cuit|pto|tipo|nro|importe|moneda|cotiz|tipoDoc|nroDoc|tipoCAE|CAE
     parts = dec.split('|')
-    return (parts[0], parts[1], parts[2], parts[3] if len(parts)>=4 else None)
+    if len(parts) >= 13:
+        res['fecha'] = parts[1]
+        res['cuit'] = parts[2]
+        res['pto'] = parts[3]
+        res['tipo'] = parts[4]
+        res['nro'] = parts[5]
+        res['importe'] = parts[6]
+        res['cae'] = parts[12]
+    return res
 
 
 # ================== INTERFAZ STREAMLIT ==================
 
-st.set_page_config(page_title="Escáner AFIP", page_icon="📂")
+st.set_page_config(page_title="Escáner AFIP", page_icon="📂", layout="wide")
 
 st.title("📂 Escáner de Facturas QR AFIP")
 
-# 1. Subida de Padrón
-st.subheader("1. Base de datos Padrón (Opcional)")
-padron_file = st.file_uploader("Subir Listado de Certificados/DNI (.xlsx)", type=['xlsx', 'xls'], help="Al cargar un archivo Excel con columnas CUIL, CUD, Vencimiento, Edad, Dependiencia (Si o No), les dara prioridad a estos DNI en la lectura.")
-allowed_dni_set = set()
+# --- BLOQUE 1: PADRÓN ---
+st.subheader("1. Base de Datos: Padrón (Afiliados)")
+padron_file = st.file_uploader("Subir Excel Padrón (.xlsx)", type=['xlsx', 'xls'], key="padron", help="Debe contener columnas: CUIL, CUD, Vencimiento, Dependencia.")
+padron_data = {} # Diccionario: dni -> {cuil, cud, venc, dep}
 
 if padron_file:
     try:
         df_padron = pd.read_excel(padron_file, dtype=str)
-        cuil_col = None
-        for col in df_padron.columns:
-            if "cuil" in col.lower():
-                cuil_col = col
-                break
-        if cuil_col:
-            for val in df_padron[cuil_col].dropna():
-                dni = _dni_from_cuil(val)
-                if len(dni) == 8: allowed_dni_set.add(dni)
-            st.success(f"✅ Padrón cargado: {len(allowed_dni_set)} DNIs válidos.")
+        # Normalizar columnas
+        df_padron.columns = [_normalize_str(c) for c in df_padron.columns]
+        
+        # Buscar columnas clave
+        col_cuil = next((c for c in df_padron.columns if 'cuil' in c), None)
+        col_cud  = next((c for c in df_padron.columns if 'cud' in c), None)
+        col_venc = next((c for c in df_padron.columns if 'venc' in c), None)
+        col_dep  = next((c for c in df_padron.columns if 'dep' in c), None) # Dependencia
+
+        if col_cuil:
+            count = 0
+            for _, row in df_padron.iterrows():
+                cuil_val = _normalize_digits(row[col_cuil])
+                if len(cuil_val) == 11:
+                    dni_val = cuil_val[2:10]
+                    padron_data[dni_val] = {
+                        'cuil': cuil_val,
+                        'cud': str(row[col_cud]) if col_cud and pd.notna(row[col_cud]) else "",
+                        'venc': str(row[col_venc]) if col_venc and pd.notna(row[col_venc]) else "",
+                        'dep': str(row[col_dep]) if col_dep and pd.notna(row[col_dep]) else ""
+                    }
+                    count += 1
+            st.success(f"✅ Padrón procesado: {count} registros indexados por DNI.")
+        else:
+            st.error("❌ No se encontró la columna 'CUIL' en el Excel del Padrón.")
     except Exception as e:
         st.error(f"Error leyendo padrón: {e}")
 
-# 2. Subida de Facturas y Opciones
-st.subheader("2. Procesamiento de Facturas")
+# --- BLOQUE 2: PRESTACIONES ---
+st.subheader("2. Base de Datos: Prestaciones (Opcional para TXT)")
+prestaciones_file = st.file_uploader("Subir Excel Prestaciones (.xlsx)", type=['xlsx', 'xls'], key="prestaciones", help="Debe contener columnas: CUIL, CUIT, CODIGO, CANTIDAD")
+prestaciones_data = {} # Clave: (cuil_afiliado, cuit_prestador) -> {codigo, cantidad}
+
+if prestaciones_file:
+    try:
+        df_prest = pd.read_excel(prestaciones_file, dtype=str)
+        df_prest.columns = [_normalize_str(c) for c in df_prest.columns]
+        
+        p_cuil = next((c for c in df_prest.columns if 'cuil' in c), None)
+        p_cuit = next((c for c in df_prest.columns if 'cuit' in c), None)
+        p_cod  = next((c for c in df_prest.columns if 'cod' in c), None) # Codigo
+        p_cant = next((c for c in df_prest.columns if 'cant' in c), None) # Cantidad
+
+        if p_cuil and p_cuit and p_cod and p_cant:
+            # Detectar duplicados de clave (CUIL + CUIT)
+            # Creamos una columna tupla para agrupar
+            df_prest['key_tuple'] = list(zip(df_prest[p_cuil].apply(_normalize_digits), df_prest[p_cuit].apply(_normalize_digits)))
+            
+            # Contar ocurrencias
+            counts = df_prest['key_tuple'].value_counts()
+            
+            loaded_count = 0
+            for _, row in df_prest.iterrows():
+                k_cuil = _normalize_digits(row[p_cuil])
+                k_cuit = _normalize_digits(row[p_cuit])
+                key = (k_cuil, k_cuit)
+                
+                # REGLA: Si la clave aparece más de una vez (ambigüedad), no cargamos nada
+                if counts.get(key, 0) == 1:
+                    prestaciones_data[key] = {
+                        'codigo': str(row[p_cod]),
+                        'cantidad': str(row[p_cant])
+                    }
+                    loaded_count += 1
+            
+            st.success(f"✅ Base Prestaciones procesada: {loaded_count} pares únicos (CUIL-CUIT) cargados. (Duplicados ignorados).")
+        else:
+            st.warning("⚠️ No se encontraron las columnas requeridas (CUIL, CUIT, CODIGO, CANTIDAD) en el archivo.")
+    except Exception as e:
+        st.error(f"Error leyendo prestaciones: {e}")
+
+# --- BLOQUE 3: PROCESAMIENTO ---
+st.subheader("3. Subida y Configuración")
+
+col_rnos, col_blank = st.columns([1, 2])
+with col_rnos:
+    rnos_input = st.text_input("Ingresar RNOS (Requerido para TXT)", "")
+
 uploaded_files = st.file_uploader("Subir Facturas PDF", type="pdf", accept_multiple_files=True)
 
-# --- OPCIONES ---
-col1, col2, col3 = st.columns(3)
-with col1:
-    opt_renombrar = st.checkbox("Renombrar archivos PDF", value=True, help="Si se marca, los archivos se renombrarán a CUIT_TIPO_PTO_NRO.pdf")
-with col2:
-    opt_excel = st.checkbox("Generar Excel reporte", value=True, help="Genera un Excel con el detalle.")
-with col3:
-    opt_solo_original = st.checkbox("Factura original", value=True, help="Si se marca, se eliminan las hojas extra, dejando solo la primera página.")
+# Opciones
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    opt_renombrar = st.checkbox("Renombrar PDFs", value=True)
+with c2:
+    opt_excel = st.checkbox("Generar Excel", value=True)
+with c3:
+    opt_solo_original = st.checkbox("Limpiar hojas extra", value=True)
+with c4:
+    opt_txt = st.checkbox("Generar TXT Salida", value=False, help="Requiere RNOS, Padrón y Base de Prestaciones cargados.")
 
+# Botón
 if st.button("Procesar Facturas") and uploaded_files:
     
-    with tempfile.TemporaryDirectory() as temp_dir:
+    # Validaciones previas para TXT
+    generar_txt = False
+    if opt_txt:
+        errors_txt = []
+        if not rnos_input: errors_txt.append("Falta RNOS")
+        if not padron_data: errors_txt.append("Falta cargar Padrón")
+        if not prestaciones_data: errors_txt.append("Falta cargar Prestaciones")
         
-        # Guardar archivos subidos en temp
+        if errors_txt:
+            st.warning(f"⚠️ No se generará el TXT: {', '.join(errors_txt)}")
+        else:
+            generar_txt = True
+
+    with tempfile.TemporaryDirectory() as temp_dir:
         paths = []
         for uploaded_file in uploaded_files:
             p = os.path.join(temp_dir, uploaded_file.name)
@@ -223,81 +334,126 @@ if st.button("Procesar Facturas") and uploaded_files:
         status_text = st.empty()
         
         rows = []
-        files_to_zip = [] # Tuplas (nombre_en_zip, ruta_fisica)
+        files_to_zip = [] 
+        txt_lines = [] # Aquí acumulamos las filas del TXT
 
         for i, path in enumerate(paths):
             fn = os.path.basename(path)
             status_text.text(f"Procesando: {fn}")
             
-            error, url, dni, periodo = '', '', '', ''
-            cuit, tipo, pto, nro, sss = '', '', '', '', ''
-
-            # Extracciones
-            dni = extraer_dni_de_pdf(path, allowed_dni_set)
+            error = ''
+            
+            # 1. Extracción Datos PDF
+            dni = extraer_dni_de_pdf(path, padron_data)
             periodo = extraer_periodo_de_pdf(path)
             url_detect = extraer_url_de_pdf(path)
 
+            qr_data = {'cuit':'', 'tipo':'', 'pto':'', 'nro':'', 'fecha':'', 'importe':'', 'cae':''}
+            
             if not url_detect:
                 error = 'QR no detectado'
             else:
-                url = url_detect
-                cuit, tipo, pto, nro = parsear_campos_qr(url)
-                sss = TIPO_MAP.get(tipo,'')
-                missing = [n for n,v in zip(['CUIT','Tipo','Pto','Nro'], [cuit,tipo,pto,nro]) if not v]
-                if missing: error = 'Faltan campos: ' + ', '.join(missing)
+                qr_data = parsear_campos_qr_completo(url_detect)
+                # Validar campos mínimos del QR
+                missing = [k for k,v in qr_data.items() if k in ['cuit','tipo','pto','nro'] and not v]
+                if missing: error = 'Faltan campos QR: ' + ', '.join(missing)
 
-            if dni and nro and dni.lstrip('0') == (nro or '').lstrip('0'): dni = ''
-            if dni and cuit:
-                cuit_digits = re.sub(r'\D', '', cuit)
-                if len(cuit_digits) == 11:
-                    dni_prestador = cuit_digits[2:10]
-                    if dni == dni_prestador: dni = ''
+            # Validaciones de lógica negocio
+            if dni and qr_data['nro'] and dni.lstrip('0') == qr_data['nro'].lstrip('0'): dni = ''
+            if dni and qr_data['cuit']:
+                cuit_digits = re.sub(r'\D', '', qr_data['cuit'])
+                if len(cuit_digits) == 11 and dni == cuit_digits[2:10]:
+                    dni = ''
+            
+            sss = TIPO_MAP.get(qr_data['tipo'],'')
+            
+            # Nombre calculado
+            nombre_calculado = ""
+            if qr_data['cuit'] and sss and qr_data['pto'] and qr_data['nro']:
+                nombre_calculado = f"{qr_data['cuit']}_{sss}_{qr_data['pto']}_{qr_data['nro']}"
 
-            # Determinar el nombre base detectado
-            nombre_calculado = f"{cuit}_{sss}_{pto}_{nro}" if (cuit and sss and pto and nro) else ""
+            # --- GENERACIÓN LÍNEA TXT ---
+            # Condiciones: Usuario quiere TXT + Bases cargadas + QR OK + DNI OK + Periodo OK
+            if generar_txt and not error and dni and periodo:
+                
+                # Datos del Padrón
+                p_info = padron_data.get(dni)
+                
+                if p_info:
+                    cuil_afiliado = p_info['cuil']
+                    cud_cod = p_info['cud']
+                    cud_venc = p_info['venc']
+                    dependencia = p_info['dep']
+                    
+                    # Datos Prestaciones (Key: CUIL Afiliado + CUIT Factura)
+                    key_prest = (cuil_afiliado, _normalize_digits(qr_data['cuit']))
+                    prest_info = prestaciones_data.get(key_prest)
+                    
+                    cod_prestacion = ""
+                    cantidad = ""
+                    
+                    if prest_info:
+                        cod_prestacion = prest_info['codigo']
+                        cantidad = prest_info['cantidad']
+                    
+                    # Armado de columnas
+                    col_1 = "DS"
+                    col_2 = rnos_input
+                    col_3 = cuil_afiliado
+                    col_4 = cud_cod
+                    col_5 = cud_venc
+                    col_6 = periodo
+                    col_7 = qr_data['cuit']
+                    col_8 = sss # Tipo mapeado
+                    col_9 = "E"
+                    col_10 = qr_data['fecha'] # Fecha emision
+                    col_11 = qr_data['cae']
+                    col_12 = qr_data['pto']
+                    col_13 = qr_data['nro']
+                    col_14 = qr_data['importe']
+                    col_15 = qr_data['importe'] # Solicitado = Total
+                    col_16 = cod_prestacion
+                    col_17 = cantidad
+                    col_18 = "00"
+                    col_19 = dependencia
+                    
+                    linea = f"{col_1}|{col_2}|{col_3}|{col_4}|{col_5}|{col_6}|{col_7}|{col_8}|{col_9}|{col_10}|{col_11}|{col_12}|{col_13}|{col_14}|{col_15}|{col_16}|{col_17}|{col_18}|{col_19}"
+                    txt_lines.append(linea)
 
-            # Lógica de guardado y manipulación PDF
+            # --- MANEJO DE ARCHIVOS (PDF) ---
             try:
                 doc = fitz.open(path); new = fitz.open()
                 new.insert_pdf(doc)
-                
-                # --- NUEVA LÓGICA: Eliminar hojas extra SOLO si el usuario lo pide ---
                 if opt_solo_original:
-                    for p in range(new.page_count-1,0,-1):
-                        new.delete_page(p)
+                    for p in range(new.page_count-1,0,-1): new.delete_page(p)
                 
-                # Decidir nombre final
+                final_name = fn
                 if opt_renombrar and not error and nombre_calculado:
-                    nombre_final_zip = nombre_calculado + ".pdf"
-                else:
-                    nombre_final_zip = fn # Nombre original
+                    final_name = nombre_calculado + ".pdf"
                 
-                out_path = os.path.join(temp_dir, "temp_processed_" + fn)
+                out_path = os.path.join(temp_dir, "proc_" + fn)
                 new.save(out_path)
                 new.close(); doc.close()
-                
-                files_to_zip.append((nombre_final_zip, out_path))
-                
+                files_to_zip.append((final_name, out_path))
             except Exception as e:
-                # Fallback en caso de error critico con el PDF
-                error = f"Error guardando PDF: {e}" if not error else error + f" | Error PDF: {e}"
+                error = f"Error PDF: {e}"
                 files_to_zip.append((fn, path))
 
+            # Reporte Excel
             rows.append({
                 'Archivo Original': fn,
                 'Archivo Generado': nombre_calculado + ".pdf" if (not error and nombre_calculado) else '',
-                'Codigo QR': url,
+                'Codigo QR': url_detect,
                 'DNI': dni,
                 'Periodo': periodo,
                 'Error': error
             })
-            
             progress_bar.progress((i + 1) / len(paths))
 
-        # Generar ZIP
+        # --- ZIP FINAL ---
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
-            
+            # 1. Excel
             if opt_excel:
                 df = pd.DataFrame(rows, columns=['Archivo Original', 'Archivo Generado', 'Codigo QR', 'DNI', 'Periodo', 'Error'])
                 excel_buffer = io.BytesIO()
@@ -305,16 +461,20 @@ if st.button("Procesar Facturas") and uploaded_files:
                     df.to_excel(writer, index=False)
                 zf.writestr("Reporte_Procesamiento.xlsx", excel_buffer.getvalue())
             
+            # 2. TXT
+            if generar_txt and txt_lines:
+                txt_content = "\n".join(txt_lines)
+                zf.writestr("salida_sistema.txt", txt_content)
+            elif opt_txt and not txt_lines:
+                # Si el usuario pidió TXT pero no salió ninguna línea (por errores o falta de match)
+                zf.writestr("salida_sistema_VACIO.txt", "No se pudieron generar líneas. Verifique errores en Excel o cruce de datos.")
+
+            # 3. PDFs
             for name, filepath in files_to_zip:
                 zf.write(filepath, name)
         
-        st.success("¡Procesamiento completado!")
-        st.download_button(
-            label="⬇️ Descargar ZIP",
-            data=zip_buffer.getvalue(),
-            file_name="facturas_procesadas.zip",
-            mime="application/zip"
-        )
+        st.success("¡Proceso Finalizado!")
+        st.download_button("⬇️ Descargar ZIP Completo", zip_buffer.getvalue(), "resultados_procesados.zip", "application/zip")
 
 
 
