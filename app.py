@@ -208,7 +208,7 @@ st.set_page_config(page_title="Escáner AFIP", page_icon="📂", layout="wide")
 st.title("📂 Escáner de Facturas QR AFIP")
 
 # --- BLOQUE 1: PADRÓN ---
-st.subheader("1. Base de Datos: Padrón (Afiliados)")
+st.subheader("1. Base de Datos: Padrón (Opcional)")
 padron_file = st.file_uploader("Subir Excel Padrón (.xlsx)", type=['xlsx', 'xls'], key="padron", help="Debe contener columnas: CUIL, CUD, Vencimiento, Dependencia.")
 padron_data = {} # Diccionario: dni -> {cuil, cud, venc, dep}
 
@@ -244,7 +244,7 @@ if padron_file:
         st.error(f"Error leyendo padrón: {e}")
 
 # --- BLOQUE 2: PRESTACIONES ---
-st.subheader("2. Base de Datos: Prestaciones (Opcional para TXT)")
+st.subheader("2. Base de Datos: Prestaciones (Opcional)")
 prestaciones_file = st.file_uploader("Subir Excel Prestaciones (.xlsx)", type=['xlsx', 'xls'], key="prestaciones", help="Debe contener columnas: CUIL, CUIT, CODIGO, CANTIDAD")
 prestaciones_data = {} # Clave: (cuil_afiliado, cuit_prestador) -> {codigo, cantidad}
 
@@ -287,11 +287,11 @@ if prestaciones_file:
         st.error(f"Error leyendo prestaciones: {e}")
 
 # --- BLOQUE 3: PROCESAMIENTO ---
-st.subheader("3. Subida y Configuración")
+st.subheader("3. RNOS y Facturas")
 
 col_rnos, col_blank = st.columns([1, 2])
 with col_rnos:
-    rnos_input = st.text_input("Ingresar RNOS (Requerido para TXT)", "")
+    rnos_input = st.text_input("Ingresar RNOS (Opcional, unicamente para generar TXT)", "")
 
 uploaded_files = st.file_uploader("Subir Facturas PDF", type="pdf", accept_multiple_files=True)
 
@@ -475,6 +475,7 @@ if st.button("Procesar Facturas") and uploaded_files:
         
         st.success("¡Proceso Finalizado!")
         st.download_button("⬇️ Descargar ZIP Completo", zip_buffer.getvalue(), "resultados_procesados.zip", "application/zip")
+
 
 
 
