@@ -205,7 +205,7 @@ with col1:
 with col2:
     opt_excel = st.checkbox("Generar Excel reporte", value=True, help="Genera un Excel con el detalle.")
 with col3:
-    opt_solo_original = st.checkbox("Mantener solo factura original", value=True, help="Si se marca, se eliminan las hojas extra, dejando solo la primera página.")
+    opt_solo_original = st.checkbox("Factura original", value=True, help="Si se marca, se eliminan las hojas extra, dejando solo la primera página.")
 
 if st.button("Procesar Facturas") and uploaded_files:
     
@@ -315,3 +315,4 @@ if st.button("Procesar Facturas") and uploaded_files:
             file_name="facturas_procesadas.zip",
             mime="application/zip"
         )
+
