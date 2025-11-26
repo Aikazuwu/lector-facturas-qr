@@ -16,6 +16,7 @@ import zipfile
 import io
 
 # --------- Configuración Tesseract ---------
+# Si lo corres en local y no detecta tesseract, descomenta la siguiente línea:
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # --------- Constantes ---------
@@ -168,10 +169,13 @@ def parsear_campos_qr(url):
 
 # ================== INTERFAZ STREAMLIT ==================
 
+st.set_page_config(page_title="Escáner AFIP", page_icon="📂")
+
 st.title("📂 Escáner de Facturas QR AFIP")
 
 # 1. Subida de Padrón
-padron_file = st.file_uploader("1. (Opcional) Subir Padrón/Listado Certificados (.xlsx)", type=['xlsx', 'xls'])
+st.subheader("1. Configuración de Padrón (Opcional)")
+padron_file = st.file_uploader("Subir Listado de Certificados/DNI (.xlsx)", type=['xlsx', 'xls'])
 allowed_dni_set = set()
 
 if padron_file:
@@ -186,12 +190,22 @@ if padron_file:
             for val in df_padron[cuil_col].dropna():
                 dni = _dni_from_cuil(val)
                 if len(dni) == 8: allowed_dni_set.add(dni)
-            st.success(f"Padrón cargado: {len(allowed_dni_set)} DNIs válidos.")
+            st.success(f"✅ Padrón cargado: {len(allowed_dni_set)} DNIs válidos.")
     except Exception as e:
         st.error(f"Error leyendo padrón: {e}")
 
-# 2. Subida de Facturas
-uploaded_files = st.file_uploader("2. Subir Facturas PDF", type="pdf", accept_multiple_files=True)
+# 2. Subida de Facturas y Opciones
+st.subheader("2. Procesamiento de Facturas")
+uploaded_files = st.file_uploader("Subir Facturas PDF", type="pdf", accept_multiple_files=True)
+
+# --- OPCIONES ---
+col1, col2, col3 = st.columns(3)
+with col1:
+    opt_renombrar = st.checkbox("Renombrar archivos PDF", value=True, help="Si se marca, los archivos se renombrarán a CUIT_TIPO_PTO_NRO.pdf")
+with col2:
+    opt_excel = st.checkbox("Generar Excel reporte", value=True, help="Genera un Excel con el detalle.")
+with col3:
+    opt_solo_original = st.checkbox("Mantener solo factura original", value=True, help="Si se marca, se eliminan las hojas extra, dejando solo la primera página.")
 
 if st.button("Procesar Facturas") and uploaded_files:
     
@@ -209,7 +223,7 @@ if st.button("Procesar Facturas") and uploaded_files:
         status_text = st.empty()
         
         rows = []
-        files_to_zip = [] # Lista de tuplas (nombre_en_zip, ruta_fisica)
+        files_to_zip = [] # Tuplas (nombre_en_zip, ruta_fisica)
 
         for i, path in enumerate(paths):
             fn = os.path.basename(path)
@@ -239,34 +253,40 @@ if st.button("Procesar Facturas") and uploaded_files:
                     dni_prestador = cuit_digits[2:10]
                     if dni == dni_prestador: dni = ''
 
-            nombre_base = f"{cuit}_{sss}_{pto}_{nro}" if not error else ""
+            # Determinar el nombre base detectado
+            nombre_calculado = f"{cuit}_{sss}_{pto}_{nro}" if (cuit and sss and pto and nro) else ""
 
-            if not error:
-                # Caso ÉXITO: Renombrar y guardar
-                try:
-                    doc = fitz.open(path); new = fitz.open()
-                    new.insert_pdf(doc)
-                    for p in range(new.page_count-1,0,-1): new.delete_page(p)
-                    
-                    nombre_final = nombre_base + ".pdf"
-                    out_path = os.path.join(temp_dir, nombre_final)
-                    new.save(out_path)
-                    new.close(); doc.close()
-                    
-                    files_to_zip.append((nombre_final, out_path))
-                except Exception as e:
-                    error = f"Error guardando PDF: {e}"
-                    # Si falla al guardar, lo mandamos como original
-                    files_to_zip.append((fn, path))
-            else:
-                # Caso ERROR: Mandar archivo original
+            # Lógica de guardado y manipulación PDF
+            try:
+                doc = fitz.open(path); new = fitz.open()
+                new.insert_pdf(doc)
+                
+                # --- NUEVA LÓGICA: Eliminar hojas extra SOLO si el usuario lo pide ---
+                if opt_solo_original:
+                    for p in range(new.page_count-1,0,-1):
+                        new.delete_page(p)
+                
+                # Decidir nombre final
+                if opt_renombrar and not error and nombre_calculado:
+                    nombre_final_zip = nombre_calculado + ".pdf"
+                else:
+                    nombre_final_zip = fn # Nombre original
+                
+                out_path = os.path.join(temp_dir, "temp_processed_" + fn)
+                new.save(out_path)
+                new.close(); doc.close()
+                
+                files_to_zip.append((nombre_final_zip, out_path))
+                
+            except Exception as e:
+                # Fallback en caso de error critico con el PDF
+                error = f"Error guardando PDF: {e}" if not error else error + f" | Error PDF: {e}"
                 files_to_zip.append((fn, path))
-            
-            # --- MODIFICACIÓN: Columnas solicitadas ---
+
             rows.append({
                 'Archivo Original': fn,
-                'Archivo Generado': nombre_base + ".pdf" if not error else '',
-                'Codigo QR': url, # Renombrado de URL
+                'Archivo Generado': nombre_calculado + ".pdf" if (not error and nombre_calculado) else '',
+                'Codigo QR': url,
                 'DNI': dni,
                 'Periodo': periodo,
                 'Error': error
@@ -274,26 +294,23 @@ if st.button("Procesar Facturas") and uploaded_files:
             
             progress_bar.progress((i + 1) / len(paths))
 
-        # --- MODIFICACIÓN: Crear DataFrame solo con columnas pedidas ---
-        df = pd.DataFrame(rows, columns=['Archivo Original', 'Archivo Generado', 'Codigo QR', 'DNI', 'Periodo', 'Error'])
-        
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False)
-        excel_data = excel_buffer.getvalue()
-
         # Generar ZIP
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
-            zf.writestr("Reporte_Procesamiento.xlsx", excel_data)
+            
+            if opt_excel:
+                df = pd.DataFrame(rows, columns=['Archivo Original', 'Archivo Generado', 'Codigo QR', 'DNI', 'Periodo', 'Error'])
+                excel_buffer = io.BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False)
+                zf.writestr("Reporte_Procesamiento.xlsx", excel_buffer.getvalue())
+            
             for name, filepath in files_to_zip:
-                # name es el nombre que tendrá dentro del ZIP
-                # filepath es donde está ahora mismo en temp
                 zf.write(filepath, name)
         
         st.success("¡Procesamiento completado!")
         st.download_button(
-            label="⬇️ Descargar ZIP (Facturas + Reporte)",
+            label="⬇️ Descargar ZIP",
             data=zip_buffer.getvalue(),
             file_name="facturas_procesadas.zip",
             mime="application/zip"
