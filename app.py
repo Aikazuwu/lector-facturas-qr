@@ -174,8 +174,8 @@ st.set_page_config(page_title="Escáner AFIP", page_icon="📂")
 st.title("📂 Escáner de Facturas QR AFIP")
 
 # 1. Subida de Padrón
-st.subheader("1. Configuración de Padrón (Opcional)")
-padron_file = st.file_uploader("Subir Listado de Certificados/DNI (.xlsx)", type=['xlsx', 'xls'])
+st.subheader("1. Base de datos Padrón (Opcional)")
+padron_file = st.file_uploader("Subir Listado de Certificados/DNI (.xlsx)", type=['xlsx', 'xls'], help="Si sube un Excel con columnas CUIL, CUD, Vencimiento, Edad, Dependiencia (Si o No), les da prioridad en la lectura.")
 allowed_dni_set = set()
 
 if padron_file:
@@ -315,4 +315,5 @@ if st.button("Procesar Facturas") and uploaded_files:
             file_name="facturas_procesadas.zip",
             mime="application/zip"
         )
+
 
